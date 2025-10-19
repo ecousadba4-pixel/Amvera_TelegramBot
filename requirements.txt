@@ -1,5 +1,6 @@
 fastapi
 uvicorn[standard]
 aiogram==3.0.0b7
+aiohttp>=3.8.5
 asyncpg
 python-dateutil
