@@ -8,7 +8,6 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import Update, ReplyKeyboardMarkup, KeyboardButton
 from contextlib import asynccontextmanager
 
-# ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -36,9 +35,8 @@ class BotService:
         digits = ''.join(ch for ch in (phone or "") if ch.isdigit())
         return digits[-10:] if len(digits) >= 10 else digits
 
-    async def get_guest_bonus(self, phone_number: str):
-        if not phone_number:
-            return None
+    async def fetch_user_row(self, phone_number):
+        """ Единая низкоуровневая функция получения строки пользователя по телефону """
         clean_phone = self.normalize_phone(phone_number)
         if not clean_phone:
             return None
@@ -49,10 +47,13 @@ class BotService:
         """
         try:
             async with self.pool.acquire() as conn:
-                row = await conn.fetchrow(query, clean_phone)
-        except Exception as e:
+                return await conn.fetchrow(query, clean_phone)
+        except Exception:
             logger.exception("Database query failed")
             return None
+
+    def parse_guest_info(self, row):
+        """ Конвертация строки БД в user dict для выдачи в боте """
         if not row:
             return None
         last_visit = row.get("last_date_visit")
@@ -70,6 +71,13 @@ class BotService:
             "expire_date": expire_date,
         }
 
+    async def get_guest_bonus(self, phone_number):
+        """ Единая точка входа во всю бизнес-логику выдачи бонусов """
+        if not phone_number:
+            return None
+        row = await self.fetch_user_row(phone_number)
+        return self.parse_guest_info(row)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Creating DB pool")
@@ -79,7 +87,6 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Failed to create DB pool")
         raise
-    # DI: BotService доступен через app.state
     app.state.bot_service = BotService(pool)
     if WEBHOOK_URL:
         try:
@@ -151,6 +158,5 @@ async def telegram_webhook(request: Request):
 async def root():
     return {"status": "ok"}
 
-# If you run uvicorn yourself: uvicorn main:app --host 0.0.0.0 --port $PORT
 
 
