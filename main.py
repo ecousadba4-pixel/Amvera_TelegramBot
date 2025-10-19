@@ -5,7 +5,7 @@ from datetime import datetime
 from dateutil.relativedelta import relativedelta
 from fastapi import FastAPI, Request, Response
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.types import Update
+from aiogram.types import Update, ReplyKeyboardMarkup, KeyboardButton
 from contextlib import asynccontextmanager
 
 # ---------- Logging ----------
@@ -21,7 +21,6 @@ PORT = int(os.getenv("PORT", "8000"))
 if not API_TOKEN:
     logger.error("Missing TELEGRAM_BOT_TOKEN environment variable")
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN environment variable")
-
 if not DATABASE_URL:
     logger.error("Missing DATABASE_URL environment variable")
     raise RuntimeError("Missing DATABASE_URL environment variable")
@@ -42,11 +41,10 @@ async def get_guest_bonus(phone_number: str, pool):
     clean_phone = normalize_phone(phone_number)
     if not clean_phone:
         return None
-
     query = """
-        SELECT first_name, loyalty_level, accumulated_bonuses, last_date_visit
-        FROM bonuses_balance
-        WHERE guest_phone = $1
+    SELECT first_name, loyalty_level, accumulated_bonuses, last_date_visit
+    FROM bonuses_balance
+    WHERE guest_phone = $1
     """
     try:
         async with pool.acquire() as conn:
@@ -54,20 +52,16 @@ async def get_guest_bonus(phone_number: str, pool):
     except Exception as e:
         logger.exception("Database query failed")
         return None
-
     if not row:
         return None
-
     last_visit = row.get("last_date_visit")
     if not last_visit:
         expire_date = "Неизвестно"
     else:
-        # last_visit expected to be date/datetime
         try:
             expire_date = (last_visit + relativedelta(months=12)).strftime("%d.%m.%Y")
         except Exception:
             expire_date = "Неизвестно"
-
     return {
         "first_name": row.get("first_name") or "Гость",
         "loyalty_level": row.get("loyalty_level") or "—",
@@ -78,12 +72,11 @@ async def get_guest_bonus(phone_number: str, pool):
 # ---------- Handlers ----------
 @dp.message(F.text == "/start")
 async def cmd_start(message: types.Message):
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.add(
-        types.KeyboardButton(
-            text="Поделиться номером телефона",
-            request_contact=True
-        )
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Поделиться номером телефона", request_contact=True)]
+        ],
+        resize_keyboard=True
     )
     await message.answer(
         "Пожалуйста, поделитесь вашим номером телефона, чтобы узнать бонусный баланс.",
@@ -122,7 +115,6 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Failed to create DB pool")
         raise
-
     # set webhook (optional) — don't crash app if it fails
     if WEBHOOK_URL:
         try:
@@ -131,9 +123,7 @@ async def lifespan(app: FastAPI):
             logger.info("Webhook set")
         except Exception:
             logger.exception("Failed to set webhook (continuing without webhook)")
-
     yield
-
     # shutdown
     logger.info("Shutting down: deleting webhook and closing pool")
     try:
