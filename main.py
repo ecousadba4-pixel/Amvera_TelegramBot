@@ -91,7 +91,7 @@ async def telegram_webhook(request: Request):
 # Настройка webhook при запуске
 @app.on_event("startup")
 async def on_startup():
-    webhook_url = "https://telegram-loyal-karinausadba.amvera.io/webhook"  # замените на ваш фактический домен
+    webhook_url = "https://telegram-loyal-karinausadba.amvera.io"  # замените на ваш фактический домен
     await bot.set_webhook(webhook_url)
 
 @app.on_event("shutdown")
