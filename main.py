@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 # ---------- Environment ----------
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://your-app.amvera.io/webhook
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 PORT = int(os.getenv("PORT", "8000"))
 
 if not API_TOKEN:
@@ -26,7 +26,7 @@ if not DATABASE_URL:
     raise RuntimeError("Missing DATABASE_URL environment variable")
 
 # ---------- Globals ----------
-POOL = None  # will be set in lifespan
+POOL = None
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
@@ -44,7 +44,7 @@ async def get_guest_bonus(phone_number: str, pool):
     query = """
     SELECT first_name, loyalty_level, bonus_balances, last_date_visit
     FROM bonuses_balance
-    WHERE guest_phone = $1
+    WHERE phone = $1
     """
     try:
         async with pool.acquire() as conn:
@@ -107,7 +107,6 @@ async def handle_contact(message: types.Message):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global POOL
-    # connect to DB
     logger.info("Creating DB pool")
     try:
         POOL = await asyncpg.create_pool(DATABASE_URL)
@@ -115,7 +114,6 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Failed to create DB pool")
         raise
-    # set webhook (optional) — don't crash app if it fails
     if WEBHOOK_URL:
         try:
             logger.info("Setting Telegram webhook to %s", WEBHOOK_URL)
@@ -124,7 +122,6 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Failed to set webhook (continuing without webhook)")
     yield
-    # shutdown
     logger.info("Shutting down: deleting webhook and closing pool")
     try:
         await bot.delete_webhook()
@@ -154,12 +151,8 @@ async def telegram_webhook(request: Request):
         logger.exception("Failed to feed update")
     return Response()
 
-# optional root
 @app.get("/")
 async def root():
     return {"status": "ok"}
 
 # If you run uvicorn yourself: uvicorn main:app --host 0.0.0.0 --port $PORT
-
-
-
