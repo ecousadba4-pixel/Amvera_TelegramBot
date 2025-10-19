@@ -96,13 +96,9 @@ async def handle_contact(message: types.Message):
     if not guest_info:
         await message.answer("Бонусы для указанного номера не найдены.")
         return
-
-    # Форматируем бонусы: целое, разделение тысяч пробелом
-    bonus_amount = int(round(guest_info['bonus_balances']))
-    bonus_formatted = '{0:,}'.format(bonus_amount).replace(',', ' ')
-
+    bonus_amount = int(float(guest_info['bonus_balances']))
     response_text = (
-        f"👋 {guest_info['first_name']}, у Вас накоплено бонусов {bonus_formatted} рублей.\n"
+        f"👋 {guest_info['first_name']}, у Вас накоплено бонусов {bonus_amount} рублей.\n"
         f"Ваш уровень лояльности — {guest_info['loyalty_level']}.\n"
         f"Срок действия бонусов: до {guest_info['expire_date']}."
     )
