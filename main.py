@@ -69,12 +69,10 @@ async def handle_contact(message: types.Message):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     webhook_url = "https://telegram-loyal-karinausadba.amvera.io/webhook"
     print("Setting webhook:", webhook_url)
     await bot.set_webhook(webhook_url)
     yield
-    # Shutdown
     print("Deleting webhook")
     await bot.delete_webhook()
 
@@ -87,3 +85,4 @@ async def telegram_webhook(request: Request):
     update = Update(**data)
     await dp.feed_update(bot, update)
     return Response()
+
