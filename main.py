@@ -1,5 +1,3 @@
-print("START")
-
 import os
 import asyncpg
 from datetime import datetime
