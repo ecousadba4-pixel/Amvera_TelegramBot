@@ -8,16 +8,14 @@ from fastapi import FastAPI, Request, Response
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import Update
 
-# Получаем токен бота и строку подключения из переменных окружения Amvera
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 bot = Bot(token=API_TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher()  # Aiogram 3.x — Dispatcher() без аргументов!
 app = FastAPI()
 
-# Команда /start
-@dp.message_handler(commands=["start"])
+@dp.message(commands=["start"])
 async def cmd_start(message: types.Message):
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
     keyboard.add(
@@ -31,10 +29,8 @@ async def cmd_start(message: types.Message):
         reply_markup=keyboard
     )
 
-# Функция для получения данных гостя из базы
 async def get_guest_bonus(phone_number: str):
     clean_phone = phone_number[-10:]
-
     conn = await asyncpg.connect(DATABASE_URL)
     query = """
         SELECT first_name, loyalty_level, accumulated_bonuses, last_date_visit
@@ -60,8 +56,7 @@ async def get_guest_bonus(phone_number: str):
         "expire_date": expire_date,
     }
 
-# Обработка контакта
-@dp.message_handler(content_types=types.ContentType.CONTACT)
+@dp.message(content_types=types.ContentType.CONTACT)
 async def handle_contact(message: types.Message):
     phone_number = message.contact.phone_number
     guest_info = await get_guest_bonus(phone_number)
@@ -75,22 +70,19 @@ async def handle_contact(message: types.Message):
         f"Ваш уровень лояльности — {guest_info['loyalty_level']}.\n"
         f"Срок действия бонусов: до {guest_info['expire_date']}."
     )
-
     await message.answer(response_text)
 
-# Webhook endpoint Telegram
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     data = await request.json()
-    print("Webhook received:", data)  # Проверка поступающих данных
+    print("Webhook received:", data)
     update = Update(**data)
-    await dp.process_update(update)
+    await dp.feed_update(bot, update)
     return Response()
 
-# Настройка webhook при запуске
 @app.on_event("startup")
 async def on_startup():
-    webhook_url = "https://telegram-loyal-karinausadba.amvera.io/webhook"  # замените на ваш фактический домен
+    webhook_url = "https://telegram-loyal-karinausadba.amvera.io/webhook"  # Ваш фактический домен
     print("Setting webhook:", webhook_url)
     await bot.set_webhook(webhook_url)
 
@@ -98,4 +90,5 @@ async def on_startup():
 async def on_shutdown():
     print("Deleting webhook")
     await bot.delete_webhook()
+
 
