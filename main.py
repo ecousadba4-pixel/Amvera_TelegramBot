@@ -7,15 +7,14 @@ from dateutil.relativedelta import relativedelta
 from fastapi import FastAPI, Request, Response
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import Update
+from contextlib import asynccontextmanager
 
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
-app = FastAPI()
 
-# Обработчик команды /start (aiogram 3.x)
 @dp.message(F.text == "/start")
 async def cmd_start(message: types.Message):
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -30,7 +29,6 @@ async def cmd_start(message: types.Message):
         reply_markup=keyboard
     )
 
-# Функция для получения данных гостя из базы
 async def get_guest_bonus(phone_number: str):
     clean_phone = phone_number[-10:]
     conn = await asyncpg.connect(DATABASE_URL)
@@ -55,7 +53,6 @@ async def get_guest_bonus(phone_number: str):
         "expire_date": expire_date,
     }
 
-# Обработка контакта (aiogram 3.x)
 @dp.message(F.contact)
 async def handle_contact(message: types.Message):
     phone_number = message.contact.phone_number
@@ -70,7 +67,19 @@ async def handle_contact(message: types.Message):
     )
     await message.answer(response_text)
 
-# Webhook endpoint Telegram
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    webhook_url = "https://telegram-loyal-karinausadba.amvera.io/webhook"
+    print("Setting webhook:", webhook_url)
+    await bot.set_webhook(webhook_url)
+    yield
+    # Shutdown
+    print("Deleting webhook")
+    await bot.delete_webhook()
+
+app = FastAPI(lifespan=lifespan)
+
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     data = await request.json()
@@ -78,17 +87,3 @@ async def telegram_webhook(request: Request):
     update = Update(**data)
     await dp.feed_update(bot, update)
     return Response()
-
-@app.on_event("startup")
-async def on_startup():
-    webhook_url = "https://telegram-loyal-karinausadba.amvera.io/webhook"
-    print("Setting webhook:", webhook_url)
-    await bot.set_webhook(webhook_url)
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    print("Deleting webhook")
-    await bot.delete_webhook()
-
-
-
