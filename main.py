@@ -1,3 +1,5 @@
+print("START")  # Для диагностики запуска
+
 import os
 import asyncpg
 from datetime import datetime
@@ -31,7 +33,6 @@ async def cmd_start(message: types.Message):
 
 # Функция для получения данных гостя из базы
 async def get_guest_bonus(phone_number: str):
-    # Оставляем последние 10 цифр телефона
     clean_phone = phone_number[-10:]
 
     conn = await asyncpg.connect(DATABASE_URL)
@@ -46,7 +47,6 @@ async def get_guest_bonus(phone_number: str):
     if not row:
         return None
 
-    # Вычисление даты сгорания бонусов — +12 месяцев после последнего визита
     last_visit = row["last_date_visit"]
     if not last_visit:
         expire_date = "Неизвестно"
@@ -71,10 +71,8 @@ async def handle_contact(message: types.Message):
         return
 
     response_text = (
-        f"{guest_info['first_name']}, у Вас накоплено {guest_info['accumulated_bonuses']} бонусов.
-"
-        f"Ваш уровень лояльности — {guest_info['loyalty_level']}.
-"
+        f"{guest_info['first_name']}, у Вас накоплено {guest_info['accumulated_bonuses']} бонусов.\n"
+        f"Ваш уровень лояльности — {guest_info['loyalty_level']}.\n"
         f"Срок действия бонусов: до {guest_info['expire_date']}."
     )
 
@@ -84,6 +82,7 @@ async def handle_contact(message: types.Message):
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     data = await request.json()
+    print("Webhook received:", data)  # Проверка поступающих данных
     update = Update(**data)
     await dp.process_update(update)
     return Response()
@@ -91,9 +90,12 @@ async def telegram_webhook(request: Request):
 # Настройка webhook при запуске
 @app.on_event("startup")
 async def on_startup():
-    webhook_url = "https://telegram-loyal-karinausadba.amvera.io"  # замените на ваш фактический домен
+    webhook_url = "https://telegram-loyal-karinausadba.amvera.io/webhook"  # замените на ваш фактический домен
+    print("Setting webhook:", webhook_url)
     await bot.set_webhook(webhook_url)
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    print("Deleting webhook")
     await bot.delete_webhook()
+
