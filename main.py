@@ -1,21 +1,22 @@
-print("START")  # Для диагностики запуска
+print("START")
 
 import os
 import asyncpg
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 from fastapi import FastAPI, Request, Response
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import Update
 
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 bot = Bot(token=API_TOKEN)
-dp = Dispatcher()  # Aiogram 3.x — Dispatcher() без аргументов!
+dp = Dispatcher()
 app = FastAPI()
 
-@dp.message(commands=["start"])
+# Обработчик команды /start (aiogram 3.x)
+@dp.message(F.text == "/start")
 async def cmd_start(message: types.Message):
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
     keyboard.add(
@@ -29,6 +30,7 @@ async def cmd_start(message: types.Message):
         reply_markup=keyboard
     )
 
+# Функция для получения данных гостя из базы
 async def get_guest_bonus(phone_number: str):
     clean_phone = phone_number[-10:]
     conn = await asyncpg.connect(DATABASE_URL)
@@ -39,16 +41,13 @@ async def get_guest_bonus(phone_number: str):
     """
     row = await conn.fetchrow(query, clean_phone)
     await conn.close()
-
     if not row:
         return None
-
     last_visit = row["last_date_visit"]
     if not last_visit:
         expire_date = "Неизвестно"
     else:
         expire_date = (last_visit + relativedelta(months=12)).strftime("%d.%m.%Y")
-
     return {
         "first_name": row["first_name"],
         "loyalty_level": row["loyalty_level"],
@@ -56,15 +55,14 @@ async def get_guest_bonus(phone_number: str):
         "expire_date": expire_date,
     }
 
-@dp.message(content_types=types.ContentType.CONTACT)
+# Обработка контакта (aiogram 3.x)
+@dp.message(F.contact)
 async def handle_contact(message: types.Message):
     phone_number = message.contact.phone_number
     guest_info = await get_guest_bonus(phone_number)
-
     if not guest_info:
         await message.answer("Бонусы для указанного номера не найдены.")
         return
-
     response_text = (
         f"{guest_info['first_name']}, у Вас накоплено {guest_info['accumulated_bonuses']} бонусов.\n"
         f"Ваш уровень лояльности — {guest_info['loyalty_level']}.\n"
@@ -72,6 +70,7 @@ async def handle_contact(message: types.Message):
     )
     await message.answer(response_text)
 
+# Webhook endpoint Telegram
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     data = await request.json()
@@ -82,7 +81,7 @@ async def telegram_webhook(request: Request):
 
 @app.on_event("startup")
 async def on_startup():
-    webhook_url = "https://telegram-loyal-karinausadba.amvera.io/webhook"  # Ваш фактический домен
+    webhook_url = "https://telegram-loyal-karinausadba.amvera.io/webhook"
     print("Setting webhook:", webhook_url)
     await bot.set_webhook(webhook_url)
 
@@ -90,5 +89,6 @@ async def on_startup():
 async def on_shutdown():
     print("Deleting webhook")
     await bot.delete_webhook()
+
 
 
