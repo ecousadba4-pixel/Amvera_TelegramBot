@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+aiogram==3.0.0b7
+asyncpg
+python-dateutil
