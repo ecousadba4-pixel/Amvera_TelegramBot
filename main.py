@@ -29,16 +29,15 @@ async def cmd_start(message: types.Message):
         reply_markup=keyboard
     )
 
-async def get_guest_bonus(phone_number: str):
+async def get_guest_bonus(phone_number: str, pool):
     clean_phone = phone_number[-10:]
-    conn = await asyncpg.connect(DATABASE_URL)
     query = """
         SELECT first_name, loyalty_level, accumulated_bonuses, last_date_visit
         FROM bonuses_balance
         WHERE guest_phone = $1
     """
-    row = await conn.fetchrow(query, clean_phone)
-    await conn.close()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(query, clean_phone)
     if not row:
         return None
     last_visit = row["last_date_visit"]
@@ -55,8 +54,11 @@ async def get_guest_bonus(phone_number: str):
 
 @dp.message(F.contact)
 async def handle_contact(message: types.Message):
+    # app — это global имя, но pool получаем через бэкап-глобал…
+    from fastapi import Request
+    pool = app.state.pool
     phone_number = message.contact.phone_number
-    guest_info = await get_guest_bonus(phone_number)
+    guest_info = await get_guest_bonus(phone_number, pool)
     if not guest_info:
         await message.answer("Бонусы для указанного номера не найдены.")
         return
@@ -72,9 +74,12 @@ async def lifespan(app: FastAPI):
     webhook_url = "https://telegram-loyal-karinausadba.amvera.io/webhook"
     print("Setting webhook:", webhook_url)
     await bot.set_webhook(webhook_url)
+    # Подключаем pool к state
+    app.state.pool = await asyncpg.create_pool(DATABASE_URL)
     yield
     print("Deleting webhook")
     await bot.delete_webhook()
+    await app.state.pool.close()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -85,4 +90,5 @@ async def telegram_webhook(request: Request):
     update = Update(**data)
     await dp.feed_update(bot, update)
     return Response()
+
 
