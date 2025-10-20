@@ -118,7 +118,7 @@ async def cmd_start(message: types.Message):
         resize_keyboard=True
     )
     await message.answer(
-        "Пожалуйста, поделитесь вашим номером телефона, чтобы узнать бонусный баланс.",
+        "Нажмите кнопку "Поделиться номером телефона" внизу, чтобы узнать бонусный баланс.",
         reply_markup=keyboard
     )
 
