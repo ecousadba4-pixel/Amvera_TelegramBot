@@ -36,7 +36,7 @@ class BotService:
         return digits[-10:] if len(digits) >= 10 else digits
 
     async def fetch_user_row(self, phone_number):
-        """ Единая низкоуровневая функция получения строки пользователя по телефону """
+        """ Получение строки пользователя по телефону """
         clean_phone = self.normalize_phone(phone_number)
         if not clean_phone:
             return None
@@ -77,6 +77,18 @@ class BotService:
             return None
         row = await self.fetch_user_row(phone_number)
         return self.parse_guest_info(row)
+
+    async def log_usage_stat(self, user_id, phone, command):
+        """ Запись события использования бота """
+        query = """
+        INSERT INTO telegram_bot_usage_stats (user_id, phone, command)
+        VALUES ($1, $2, $3)
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute(query, user_id, phone, command)
+        except Exception:
+            logger.exception("Failed to log usage stat")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -125,25 +137,31 @@ async def cmd_start(message: types.Message):
 @dp.message(F.contact)
 async def handle_contact(message: types.Message):
     phone_number = message.contact.phone_number
-    logger.info("Received contact from %s (user_id=%s)", phone_number, message.from_user.id)
+    user_id = message.from_user.id
+    logger.info("Received contact from %s (user_id=%s)", phone_number, user_id)
     bot_service = app.state.bot_service
+    
+    # Записать событие
+    await bot_service.log_usage_stat(
+        user_id=user_id,
+        phone=phone_number,
+        command="contact"
+    )
+    
     guest_info = await bot_service.get_guest_bonus(phone_number)
     if not guest_info:
         await message.answer("Бонусы для указанного номера не найдены.")
         return
-    # --- Код ниже скорректирован ---
     try:
         bonus_amount = int(float(guest_info['bonus_balances']))
     except Exception:
         bonus_amount = 0
-
     response_text = (
         f"👋 {guest_info['first_name']}, у Вас накоплено бонусов {bonus_amount} рублей.\n"
         f"Ваш уровень лояльности — {guest_info['loyalty_level']}."
     )
     if bonus_amount > 0:
         response_text += f"\nСрок действия бонусов: до {guest_info['expire_date']}."
-
     await message.answer(response_text)
 
 @app.post("/webhook")
