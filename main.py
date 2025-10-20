@@ -131,17 +131,20 @@ async def handle_contact(message: types.Message):
     if not guest_info:
         await message.answer("Бонусы для указанного номера не найдены.")
         return
-    bonus_amount = int(float(guest_info['bonus_balances']))
-response_text = (
-    f"👋 {guest_info['first_name']}, у Вас накоплено бонусов {bonus_amount} рублей.\n"
-    f"Ваш уровень лояльности — {guest_info['loyalty_level']}."
-)
+    # --- Код ниже скорректирован ---
+    try:
+        bonus_amount = int(float(guest_info['bonus_balances']))
+    except Exception:
+        bonus_amount = 0
 
-# Показывать срок действия только если бонусов больше 0
-if bonus_amount > 0:
-    response_text += f"\nСрок действия бонусов: до {guest_info['expire_date']}."
+    response_text = (
+        f"👋 {guest_info['first_name']}, у Вас накоплено бонусов {bonus_amount} рублей.\n"
+        f"Ваш уровень лояльности — {guest_info['loyalty_level']}."
+    )
+    if bonus_amount > 0:
+        response_text += f"\nСрок действия бонусов: до {guest_info['expire_date']}."
 
-await message.answer(response_text)
+    await message.answer(response_text)
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
@@ -161,6 +164,3 @@ async def telegram_webhook(request: Request):
 @app.get("/")
 async def root():
     return {"status": "ok"}
-
-
-
