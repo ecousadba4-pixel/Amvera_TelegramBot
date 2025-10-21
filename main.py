@@ -1,46 +1,37 @@
 import os
 import logging
+import asyncpg
 from datetime import datetime
-from typing import Optional
 from dateutil.relativedelta import relativedelta
 from fastapi import FastAPI, Request, Response
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import Update, ReplyKeyboardMarkup, KeyboardButton
 from contextlib import asynccontextmanager
-# Импорты Pydantic
-from pydantic import BaseModel, ValidationError
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Optional # Добавлен импорт для Optional
 
-# --- Настройка логирования ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Модели Pydantic ---
-
-class Settings(BaseSettings):
-    telegram_bot_token: str
-    database_url: str
-    webhook_url: Optional[str] = None
-    port: int = 8000
-
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding='utf-8')
-
-class DBUserRow(BaseModel):
-    first_name: Optional[str] = "Гость"
-    loyalty_level: Optional[str] = "—"
-    bonus_balances: Optional[float] = 0.0  # float, чтобы избежать проблем при int(float())
-    last_date_visit: Optional[datetime] = None
-
-class GuestInfo(BaseModel):
-    first_name: str
-    loyalty_level: str
-    bonus_balances: int
-    expire_date: str
-
-# --- Загрузка настроек ---
-settings = Settings()
-
 # --- Константы ---
+# Переменные окружения (теперь просто строки для удобства)
+ENV_TELEGRAM_BOT_TOKEN = "TELEGRAM_BOT_TOKEN"
+ENV_DATABASE_URL = "DATABASE_URL"
+ENV_WEBHOOK_URL = "WEBHOOK_URL"
+ENV_PORT = "PORT"
+
+# Названия таблиц и столбцов (если нужно централизовать)
+TABLE_BONUSES_BALANCE = "bonuses_balance"
+COL_PHONE = "phone"
+COL_FIRST_NAME = "first_name"
+COL_LOYALTY_LEVEL = "loyalty_level"
+COL_BONUS_BALANCES = "bonus_balances"
+COL_LAST_DATE_VISIT = "last_date_visit"
+
+TABLE_TELEGRAM_BOT_STATS = "telegram_bot_usage_stats"
+COL_USER_ID = "user_id"
+COL_PHONE_STATS = "phone"
+COL_COMMAND = "command"
+
 # Тексты сообщений и кнопок
 MSG_START = "Нажмите кнопку Поделиться номером телефона внизу, чтобы узнать бонусный баланс."
 BTN_SHARE_PHONE = "Поделиться номером телефона"
@@ -50,29 +41,31 @@ MSG_BALANCE_TEMPLATE = "👋 {first_name}, у Вас накоплено бону
 MSG_EXPIRY_TEMPLATE = "\nСрок действия бонусов: до {date}."
 
 # SQL Запросы
-SQL_FETCH_USER = """
-SELECT first_name, loyalty_level, bonus_balances, last_date_visit
-FROM bonuses_balance
-WHERE phone = $1
+SQL_FETCH_USER = f"""
+SELECT {COL_FIRST_NAME}, {COL_LOYALTY_LEVEL}, {COL_BONUS_BALANCES}, {COL_LAST_DATE_VISIT}
+FROM {TABLE_BONUSES_BALANCE}
+WHERE {COL_PHONE} = $1
 """
 
-SQL_LOG_USAGE = """
-INSERT INTO telegram_bot_usage_stats (user_id, phone, command)
+SQL_LOG_USAGE = f"""
+INSERT INTO {TABLE_TELEGRAM_BOT_STATS} ({COL_USER_ID}, {COL_PHONE_STATS}, {COL_COMMAND})
 VALUES ($1, $2, $3)
 """
 
-# --- Инициализация ---
-API_TOKEN = settings.telegram_bot_token
-DATABASE_URL = settings.database_url
-WEBHOOK_URL = settings.webhook_url
-PORT = settings.port
+# --- /Константы ---
+
+# Загрузка настроек (без pydantic_settings)
+API_TOKEN = os.getenv(ENV_TELEGRAM_BOT_TOKEN)
+DATABASE_URL = os.getenv(ENV_DATABASE_URL)
+WEBHOOK_URL = os.getenv(ENV_WEBHOOK_URL)
+PORT = int(os.getenv(ENV_PORT, "8000"))
 
 if not API_TOKEN:
-    logger.error("Missing TELEGRAM_BOT_TOKEN environment variable")
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN environment variable")
+    logger.error(f"Missing {ENV_TELEGRAM_BOT_TOKEN} environment variable")
+    raise RuntimeError(f"Missing {ENV_TELEGRAM_BOT_TOKEN} environment variable")
 if not DATABASE_URL:
-    logger.error("Missing DATABASE_URL environment variable")
-    raise RuntimeError("Missing DATABASE_URL environment variable")
+    logger.error(f"Missing {ENV_DATABASE_URL} environment variable")
+    raise RuntimeError(f"Missing {ENV_DATABASE_URL} environment variable")
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
@@ -86,59 +79,47 @@ class BotService:
         digits = ''.join(ch for ch in (phone or "") if ch.isdigit())
         return digits[-10:] if len(digits) >= 10 else digits
 
-    async def fetch_user_row(self, phone_number) -> Optional[DBUserRow]:
-        """ Получение строки пользователя по телефону и прямое преобразование в GuestInfo """
+    async def fetch_user_row(self, phone_number):
+        """ Получение строки пользователя по телефону """
         clean_phone = self.normalize_phone(phone_number)
         if not clean_phone:
             return None
         query = SQL_FETCH_USER
         try:
             async with self.pool.acquire() as conn:
-                raw_row = await conn.fetchrow(query, clean_phone)
-                if raw_row:
-                    # Преобразуем строку из базы в модель DBUserRow напрямую из Record
-                    db_row = DBUserRow.model_validate(raw_row) # Pydantic может работать с Record
-                    # Выполняем логику преобразования в GuestInfo сразу здесь
-
-                    last_visit = db_row.last_date_visit
-                    if not last_visit:
-                        expire_date = "Неизвестно"
-                    else:
-                        try:
-                            expire_date = (last_visit + relativedelta(months=12)).strftime("%d.%m.%Y")
-                        except Exception as e:
-                            logger.warning(f"Failed to calculate expire date for {last_visit}: {e}")
-                            expire_date = "Неизвестно"
-
-                    # Преобразуем бонусы к int
-                    try:
-                        bonus_amount = int(float(db_row.bonus_balances))
-                    except (ValueError, TypeError) as e:
-                        logger.warning(f"Could not convert bonus_balances '{db_row.bonus_balances}' to int: {e}")
-                        bonus_amount = 0
-
-                    return GuestInfo(
-                        first_name=db_row.first_name,
-                        loyalty_level=db_row.loyalty_level,
-                        bonus_balances=bonus_amount,
-                        expire_date=expire_date
-                    )
-                return None
+                return await conn.fetchrow(query, clean_phone)
         except Exception:
             logger.exception("Database query failed")
             return None
 
-    # Метод parse_guest_info убран, его логика встроена в fetch_user_row
-    # async def parse_guest_info(self, db_row: Optional[DBUserRow]) -> Optional[GuestInfo]:
-    #     # ... (старая логика, теперь встроена)
-    #     pass
+    def parse_guest_info(self, row):
+        """ Конвертация строки БД в user dict для выдачи в боте """
+        if not row:
+            return None
+        last_visit = row.get(COL_LAST_DATE_VISIT)
+        if not last_visit:
+            expire_date = "Неизвестно"
+        else:
+            try:
+                expire_date = (last_visit + relativedelta(months=12)).strftime("%d.%m.%Y")
+            except Exception as e:
+                logger.warning(f"Failed to calculate expire date for {last_visit}: {e}")
+                expire_date = "Неизвестно"
+        return {
+            "first_name": row.get(COL_FIRST_NAME) or "Гость",
+            "loyalty_level": row.get(COL_LOYALTY_LEVEL) or "—",
+            "bonus_balances": row.get(COL_BONUS_BALANCES) or 0,
+            "expire_date": expire_date,
+        }
 
-    # Метод get_guest_bonus убран, его логика встроена в fetch_user_row
-    async def get_guest_bonus(self, phone_number) -> Optional[GuestInfo]:
+    async def get_guest_bonus(self, phone_number):
         """ Единая точка входа во всю бизнес-логику выдачи бонусов """
-        return await self.fetch_user_row(phone_number) # Теперь просто вызывает fetch_user_row
+        if not phone_number:
+            return None
+        row = await self.fetch_user_row(phone_number)
+        return self.parse_guest_info(row)
 
-    async def log_usage_stat(self, user_id: int, phone: str, command: str):
+    async def log_usage_stat(self, user_id, phone, command):
         """ Запись события использования бота """
         query = SQL_LOG_USAGE
         try:
@@ -151,7 +132,6 @@ class BotService:
 async def lifespan(app: FastAPI):
     logger.info("Creating DB pool")
     try:
-        import asyncpg # Импорт внутри, чтобы не требовался при запуске других частей
         pool = await asyncpg.create_pool(DATABASE_URL)
         logger.info("DB pool created")
     except Exception:
@@ -209,24 +189,29 @@ async def handle_contact(message: types.Message):
         logger.error(f"Failed to log usage stat for user {user_id}: {e}")
 
     try:
-        guest_info: Optional[GuestInfo] = await bot_service.get_guest_bonus(phone_number)
+        guest_info = await bot_service.get_guest_bonus(phone_number)
     except Exception as e:
         logger.error(f"Failed to fetch bonus info for phone {phone_number} (user_id={user_id}): {e}")
         await message.answer("Произошла ошибка при получении данных. Попробуйте позже.")
         return
 
-    if not guest_info: # guest_info теперь гарантированно GuestInfo или None
+    if not guest_info:
         await message.answer(MSG_NO_BONUS)
         return
 
-    # bonus_amount теперь int благодаря встроенной логике
+    try:
+        bonus_amount = int(float(guest_info['bonus_balances']))
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Could not convert bonus_balances '{guest_info['bonus_balances']}' to int for user {user_id}: {e}")
+        bonus_amount = 0
+
     response_text = MSG_BALANCE_TEMPLATE.format(
-        first_name=guest_info.first_name,
-        amount=guest_info.bonus_balances,
-        level=guest_info.loyalty_level
+        first_name=guest_info['first_name'],
+        amount=bonus_amount,
+        level=guest_info['loyalty_level']
     )
-    if guest_info.bonus_balances > 0: # Теперь можно безопасно обращаться к .bonus_balances
-        response_text += MSG_EXPIRY_TEMPLATE.format(date=guest_info.expire_date)
+    if bonus_amount > 0:
+        response_text += MSG_EXPIRY_TEMPLATE.format(date=guest_info['expire_date'])
 
     try:
         await message.answer(response_text)
@@ -251,7 +236,3 @@ async def telegram_webhook(request: Request):
 @app.get("/")
 async def root():
     return {"status": "ok"}
-
-
-
-
