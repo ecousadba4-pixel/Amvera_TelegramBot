@@ -136,6 +136,12 @@ async def cmd_start(message: types.Message):
 
 @dp.message(F.contact)
 async def handle_contact(message: types.Message):
+    # --- ПРОВЕРКА: принадлежит ли контакт отправителю ---
+    if message.contact.user_id != message.from_user.id:
+        await message.answer("❌ Вы можете проверить информацию только для своего номера телефона.")
+        return
+    # --- КОНЕЦ ПРОВЕРКИ ---
+
     phone_number = message.contact.phone_number
     user_id = message.from_user.id
     logger.info("Received contact from %s (user_id=%s)", phone_number, user_id)
@@ -182,3 +188,4 @@ async def telegram_webhook(request: Request):
 @app.get("/")
 async def root():
     return {"status": "ok"}
+
