@@ -87,7 +87,7 @@ class BotService:
         return digits[-10:] if len(digits) >= 10 else digits
 
     async def fetch_user_row(self, phone_number) -> Optional[DBUserRow]:
-        """ Получение строки пользователя по телефону """
+        """ Получение строки пользователя по телефону и прямое преобразование в GuestInfo """
         clean_phone = self.normalize_phone(phone_number)
         if not clean_phone:
             return None
@@ -96,48 +96,47 @@ class BotService:
             async with self.pool.acquire() as conn:
                 raw_row = await conn.fetchrow(query, clean_phone)
                 if raw_row:
-                    # Преобразуем строку из базы в модель Pydantic
-                    return DBUserRow.model_validate(dict(raw_row))
+                    # Преобразуем строку из базы в модель DBUserRow напрямую из Record
+                    db_row = DBUserRow.model_validate(raw_row) # Pydantic может работать с Record
+                    # Выполняем логику преобразования в GuestInfo сразу здесь
+
+                    last_visit = db_row.last_date_visit
+                    if not last_visit:
+                        expire_date = "Неизвестно"
+                    else:
+                        try:
+                            expire_date = (last_visit + relativedelta(months=12)).strftime("%d.%m.%Y")
+                        except Exception as e:
+                            logger.warning(f"Failed to calculate expire date for {last_visit}: {e}")
+                            expire_date = "Неизвестно"
+
+                    # Преобразуем бонусы к int
+                    try:
+                        bonus_amount = int(float(db_row.bonus_balances))
+                    except (ValueError, TypeError) as e:
+                        logger.warning(f"Could not convert bonus_balances '{db_row.bonus_balances}' to int: {e}")
+                        bonus_amount = 0
+
+                    return GuestInfo(
+                        first_name=db_row.first_name,
+                        loyalty_level=db_row.loyalty_level,
+                        bonus_balances=bonus_amount,
+                        expire_date=expire_date
+                    )
                 return None
         except Exception:
             logger.exception("Database query failed")
             return None
 
-    def parse_guest_info(self, db_row: Optional[DBUserRow]) -> Optional[GuestInfo]:
-        """ Конвертация строки БД в модель для выдачи в боте """
-        if not db_row:
-            return None
+    # Метод parse_guest_info убран, его логика встроена в fetch_user_row
+    # async def parse_guest_info(self, db_row: Optional[DBUserRow]) -> Optional[GuestInfo]:
+    #     # ... (старая логика, теперь встроена)
+    #     pass
 
-        last_visit = db_row.last_date_visit
-        if not last_visit:
-            expire_date = "Неизвестно"
-        else:
-            try:
-                expire_date = (last_visit + relativedelta(months=12)).strftime("%d.%m.%Y")
-            except Exception as e:
-                logger.warning(f"Failed to calculate expire date for {last_visit}: {e}")
-                expire_date = "Неизвестно"
-
-        # Преобразуем бонусы к int
-        try:
-            bonus_amount = int(float(db_row.bonus_balances))
-        except (ValueError, TypeError) as e:
-            logger.warning(f"Could not convert bonus_balances '{db_row.bonus_balances}' to int: {e}")
-            bonus_amount = 0
-
-        return GuestInfo(
-            first_name=db_row.first_name,
-            loyalty_level=db_row.loyalty_level,
-            bonus_balances=bonus_amount,
-            expire_date=expire_date
-        )
-
+    # Метод get_guest_bonus убран, его логика встроена в fetch_user_row
     async def get_guest_bonus(self, phone_number) -> Optional[GuestInfo]:
         """ Единая точка входа во всю бизнес-логику выдачи бонусов """
-        if not phone_number:
-            return None
-        db_row = await self.fetch_user_row(phone_number)
-        return self.parse_guest_info(db_row)
+        return await self.fetch_user_row(phone_number) # Теперь просто вызывает fetch_user_row
 
     async def log_usage_stat(self, user_id: int, phone: str, command: str):
         """ Запись события использования бота """
@@ -220,7 +219,7 @@ async def handle_contact(message: types.Message):
         await message.answer(MSG_NO_BONUS)
         return
 
-    # bonus_amount теперь int благодаря parse_guest_info
+    # bonus_amount теперь int благодаря встроенной логике
     response_text = MSG_BALANCE_TEMPLATE.format(
         first_name=guest_info.first_name,
         amount=guest_info.bonus_balances,
@@ -252,6 +251,7 @@ async def telegram_webhook(request: Request):
 @app.get("/")
 async def root():
     return {"status": "ok"}
+
 
 
 
