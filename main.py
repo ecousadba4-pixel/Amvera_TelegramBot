@@ -1,23 +1,22 @@
-import os
 import logging
-import asyncpg
-from datetime import datetime
-from dateutil.relativedelta import relativedelta
-from fastapi import FastAPI, Request, Response
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.types import Update, ReplyKeyboardMarkup, KeyboardButton
 from contextlib import asynccontextmanager
-from typing import Optional # Добавлен импорт для Optional
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from typing import Any, Optional
+
+import asyncpg
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import CommandStart
+from aiogram.types import KeyboardButton, ReplyKeyboardMarkup, Update
+from dateutil.relativedelta import relativedelta
+from fastapi import FastAPI, Request, Response, status
+
+from config import get_settings
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --- Константы ---
-# Переменные окружения (теперь просто строки для удобства)
-ENV_TELEGRAM_BOT_TOKEN = "TELEGRAM_BOT_TOKEN"
-ENV_DATABASE_URL = "DATABASE_URL"
-ENV_WEBHOOK_URL = "WEBHOOK_URL"
-ENV_PORT = "PORT"
 
 # Названия таблиц и столбцов (если нужно централизовать)
 TABLE_BONUSES_BALANCE = "bonuses_balance"
@@ -54,24 +53,13 @@ VALUES ($1, $2, $3)
 
 # --- /Константы ---
 
-# Загрузка настроек (без pydantic_settings)
-API_TOKEN = os.getenv(ENV_TELEGRAM_BOT_TOKEN)
-DATABASE_URL = os.getenv(ENV_DATABASE_URL)
-WEBHOOK_URL = os.getenv(ENV_WEBHOOK_URL)
-PORT = int(os.getenv(ENV_PORT, "8000"))
+settings = get_settings()
 
-if not API_TOKEN:
-    logger.error(f"Missing {ENV_TELEGRAM_BOT_TOKEN} environment variable")
-    raise RuntimeError(f"Missing {ENV_TELEGRAM_BOT_TOKEN} environment variable")
-if not DATABASE_URL:
-    logger.error(f"Missing {ENV_DATABASE_URL} environment variable")
-    raise RuntimeError(f"Missing {ENV_DATABASE_URL} environment variable")
-
-bot = Bot(token=API_TOKEN)
+bot = Bot(token=settings.telegram_bot_token)
 dp = Dispatcher()
 
 class BotService:
-    def __init__(self, pool):
+    def __init__(self, pool: asyncpg.Pool):
         self.pool = pool
 
     @staticmethod
@@ -79,8 +67,8 @@ class BotService:
         digits = ''.join(ch for ch in (phone or "") if ch.isdigit())
         return digits[-10:] if len(digits) >= 10 else digits
 
-    async def fetch_user_row(self, phone_number):
-        """ Получение строки пользователя по телефону """
+    async def fetch_user_row(self, phone_number: str) -> Optional[asyncpg.Record]:
+        """Получение строки пользователя по телефону."""
         clean_phone = self.normalize_phone(phone_number)
         if not clean_phone:
             return None
@@ -92,11 +80,12 @@ class BotService:
             logger.exception("Database query failed")
             return None
 
-    def parse_guest_info(self, row):
-        """ Конвертация строки БД в user dict для выдачи в боте """
+    def parse_guest_info(self, row: Optional[asyncpg.Record]) -> Optional[dict[str, Any]]:
+        """Конвертация строки БД в user dict для выдачи в боте."""
         if not row:
             return None
-        last_visit = row.get(COL_LAST_DATE_VISIT)
+        row_dict = dict(row)
+        last_visit: Optional[datetime] = row_dict.get(COL_LAST_DATE_VISIT)
         if not last_visit:
             expire_date = "Неизвестно"
         else:
@@ -106,21 +95,21 @@ class BotService:
                 logger.warning(f"Failed to calculate expire date for {last_visit}: {e}")
                 expire_date = "Неизвестно"
         return {
-            "first_name": row.get(COL_FIRST_NAME) or "Гость",
-            "loyalty_level": row.get(COL_LOYALTY_LEVEL) or "—",
-            "bonus_balances": row.get(COL_BONUS_BALANCES) or 0,
+            "first_name": row_dict.get(COL_FIRST_NAME) or "Гость",
+            "loyalty_level": row_dict.get(COL_LOYALTY_LEVEL) or "—",
+            "bonus_balances": row_dict.get(COL_BONUS_BALANCES) or 0,
             "expire_date": expire_date,
         }
 
-    async def get_guest_bonus(self, phone_number):
-        """ Единая точка входа во всю бизнес-логику выдачи бонусов """
+    async def get_guest_bonus(self, phone_number: str) -> Optional[dict[str, Any]]:
+        """Единая точка входа во всю бизнес-логику выдачи бонусов."""
         if not phone_number:
             return None
         row = await self.fetch_user_row(phone_number)
         return self.parse_guest_info(row)
 
-    async def log_usage_stat(self, user_id, phone, command):
-        """ Запись события использования бота """
+    async def log_usage_stat(self, user_id: int, phone: str, command: str) -> None:
+        """Запись события использования бота."""
         query = SQL_LOG_USAGE
         try:
             async with self.pool.acquire() as conn:
@@ -128,20 +117,35 @@ class BotService:
         except Exception:
             logger.exception("Failed to log usage stat")
 
+    @staticmethod
+    def format_bonus_amount(value: Any) -> int:
+        """Безопасное преобразование бонусного баланса к int."""
+
+        try:
+            return int(Decimal(str(value)))
+        except (InvalidOperation, TypeError, ValueError):
+            logger.warning("Could not convert bonus_balances '%s' to int", value)
+            return 0
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Creating DB pool")
     try:
-        pool = await asyncpg.create_pool(DATABASE_URL)
+        pool = await asyncpg.create_pool(
+            str(settings.database_url),
+            min_size=settings.pool_min_size,
+            max_size=settings.pool_max_size,
+        )
         logger.info("DB pool created")
     except Exception:
         logger.exception("Failed to create DB pool")
         raise
     app.state.bot_service = BotService(pool)
-    if WEBHOOK_URL:
+    app.state.settings = settings
+    if settings.webhook_url:
         try:
-            logger.info(f"Setting Telegram webhook to {WEBHOOK_URL}")
-            await bot.set_webhook(WEBHOOK_URL)
+            logger.info("Setting Telegram webhook to %s", settings.webhook_url)
+            await bot.set_webhook(str(settings.webhook_url))
             logger.info("Webhook set")
         except Exception:
             logger.exception("Failed to set webhook (continuing without webhook)")
@@ -159,7 +163,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-@dp.message(F.text == "/start")
+@dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
@@ -199,11 +203,7 @@ async def handle_contact(message: types.Message):
         await message.answer(MSG_NO_BONUS)
         return
 
-    try:
-        bonus_amount = int(float(guest_info['bonus_balances']))
-    except (ValueError, TypeError) as e:
-        logger.warning(f"Could not convert bonus_balances '{guest_info['bonus_balances']}' to int for user {user_id}: {e}")
-        bonus_amount = 0
+    bonus_amount = bot_service.format_bonus_amount(guest_info['bonus_balances'])
 
     response_text = MSG_BALANCE_TEMPLATE.format(
         first_name=guest_info['first_name'],
@@ -226,12 +226,12 @@ async def telegram_webhook(request: Request):
         update = Update(**data)
     except Exception:
         logger.exception("Failed to parse update")
-        return Response(status_code=400)
+        return Response(status_code=status.HTTP_400_BAD_REQUEST)
     try:
         await dp.feed_update(bot, update)
     except Exception:
         logger.exception("Failed to feed update")
-    return Response()
+    return Response(status_code=status.HTTP_200_OK)
 
 @app.get("/")
 async def root():
