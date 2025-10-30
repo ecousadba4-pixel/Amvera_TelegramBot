@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -59,8 +60,52 @@ bot = Bot(token=settings.telegram_bot_token)
 dp = Dispatcher()
 
 class BotService:
-    def __init__(self, pool: asyncpg.Pool):
-        self.pool = pool
+    def __init__(self, dsn: str, min_size: int, max_size: int):
+        self._dsn = dsn
+        self._min_size = min_size
+        self._max_size = max_size
+        self._pool: Optional[asyncpg.Pool] = None
+        self._pool_lock = asyncio.Lock()
+
+    def _pool_active(self) -> bool:
+        return bool(
+            self._pool
+            and not getattr(self._pool, "_closing", False)
+            and not getattr(self._pool, "_closed", False)
+        )
+
+    async def _ensure_pool(self) -> asyncpg.Pool:
+        if self._pool_active():
+            return self._pool
+
+        async with self._pool_lock:
+            if self._pool_active():
+                return self._pool
+            logger.info("Creating DB pool")
+            try:
+                self._pool = await asyncpg.create_pool(
+                    self._dsn,
+                    min_size=self._min_size,
+                    max_size=self._max_size,
+                )
+                logger.info("DB pool created")
+            except Exception as exc:
+                logger.exception("Failed to create DB pool")
+                self._pool = None
+                raise RuntimeError("Database pool is unavailable") from exc
+            return self._pool
+
+    async def close(self) -> None:
+        async with self._pool_lock:
+            if not self._pool_active():
+                return
+            try:
+                await self._pool.close()
+                logger.info("DB pool closed")
+            except Exception:
+                logger.exception("Failed to close DB pool")
+            finally:
+                self._pool = None
 
     @staticmethod
     def normalize_phone(phone: str) -> str:
@@ -74,8 +119,11 @@ class BotService:
             return None
         query = SQL_FETCH_USER
         try:
-            async with self.pool.acquire() as conn:
+            pool = await self._ensure_pool()
+            async with pool.acquire() as conn:
                 return await conn.fetchrow(query, clean_phone)
+        except RuntimeError:
+            raise
         except Exception:
             logger.exception("Database query failed")
             return None
@@ -112,7 +160,8 @@ class BotService:
         """Запись события использования бота."""
         query = SQL_LOG_USAGE
         try:
-            async with self.pool.acquire() as conn:
+            pool = await self._ensure_pool()
+            async with pool.acquire() as conn:
                 await conn.execute(query, user_id, phone, command)
         except Exception:
             logger.exception("Failed to log usage stat")
@@ -129,18 +178,12 @@ class BotService:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Creating DB pool")
-    try:
-        pool = await asyncpg.create_pool(
-            str(settings.database_url),
-            min_size=settings.pool_min_size,
-            max_size=settings.pool_max_size,
-        )
-        logger.info("DB pool created")
-    except Exception:
-        logger.exception("Failed to create DB pool")
-        raise
-    app.state.bot_service = BotService(pool)
+    bot_service = BotService(
+        dsn=str(settings.database_url),
+        min_size=settings.pool_min_size,
+        max_size=settings.pool_max_size,
+    )
+    app.state.bot_service = bot_service
     app.state.settings = settings
     if settings.webhook_url:
         try:
@@ -155,11 +198,7 @@ async def lifespan(app: FastAPI):
         await bot.delete_webhook()
     except Exception:
         logger.exception("Failed to delete webhook (ignoring)")
-    try:
-        await pool.close()
-        logger.info("DB pool closed")
-    except Exception:
-        logger.exception("Failed to close DB pool")
+    await bot_service.close()
 
 app = FastAPI(lifespan=lifespan)
 
