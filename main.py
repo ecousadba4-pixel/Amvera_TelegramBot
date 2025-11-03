@@ -1,12 +1,15 @@
-"""Упрощённая версия Telegram webhook сервера без внешних зависимостей."""
+"""ASGI-приложение Telegram webhook сервера для Amvera."""
 
 from __future__ import annotations
 
 import json
 import logging
 from datetime import datetime, timedelta
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
+
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from config import get_settings
 
@@ -176,120 +179,106 @@ class BotService:
             return 0
 
 
-class TelegramHTTPServer(ThreadingHTTPServer):
-    def __init__(self, server_address: tuple[str, int], bot_service: BotService) -> None:
-        super().__init__(server_address, TelegramRequestHandler)
-        self.bot_service = bot_service
-        self.allow_reuse_address = True
+app = FastAPI(title="Telegram Loyal Bot")
 
 
-class TelegramRequestHandler(BaseHTTPRequestHandler):
-    server_version = "TelegramStub/1.0"
+@app.on_event("startup")
+def on_startup() -> None:
+    """Подготовить сервис при запуске приложения."""
 
-    def do_GET(self) -> None:  # noqa: N802 (совместимость с BaseHTTPRequestHandler)
-        if self.path != "/":
-            self._send_json(404, {"error": "not found"})
-            return
-        self._send_json(200, {"status": "ok", "message": MSG_START, "button": BTN_SHARE_PHONE})
+    settings = get_settings()
+    data = load_bonus_data(settings.bonus_data_file)
+    app.state.settings = settings
+    app.state.bot_service = BotService(data, settings.default_expiry_days)
+    logger.info("ASGI-приложение инициализировано. Используется порт %s.", settings.port)
 
-    def do_POST(self) -> None:  # noqa: N802
-        if self.path != "/webhook":
-            self._send_json(404, {"error": "not found"})
-            return
 
-        content_length = self._content_length()
-        raw_body = self.rfile.read(content_length) if content_length else b""
-        try:
-            payload = json.loads(raw_body.decode("utf-8") or "{}")
-        except json.JSONDecodeError:
-            self._send_json(400, {"error": "invalid json"})
-            return
+def _get_bot_service(request: Request) -> BotService:
+    bot_service = getattr(request.app.state, "bot_service", None)
+    if bot_service is None:
+        settings = get_settings()
+        data = load_bonus_data(settings.bonus_data_file)
+        bot_service = BotService(data, settings.default_expiry_days)
+        request.app.state.bot_service = bot_service
+    return cast(BotService, bot_service)
 
-        message = payload.get("message")
-        if not isinstance(message, dict):
-            self._send_json(400, {"error": "message field is required"})
-            return
 
-        logger.info(
-            "Получено сообщение: %s",
-            json.dumps(sanitize_payload(message), ensure_ascii=False),
-        )
+def _bad_request(message: str) -> JSONResponse:
+    return JSONResponse(status_code=400, content={"error": message})
 
-        contact = message.get("contact")
-        if not isinstance(contact, dict):
-            self._send_json(400, {"error": "contact field is required"})
-            return
-        phone_number = contact.get("phone_number")
-        if not phone_number:
-            self._send_json(400, {"error": "phone_number is required"})
-            return
 
-        from_user = message.get("from") if isinstance(message.get("from"), dict) else {}
-        sender_id = from_user.get("id") if isinstance(from_user, dict) else None
-        contact_user_id = contact.get("user_id")
-        if (
-            sender_id is not None
-            and contact_user_id is not None
-            and sender_id != contact_user_id
-        ):
-            self._send_json(200, {"reply": MSG_INVALID_CONTACT})
-            return
+@app.get("/")
+async def read_root() -> Dict[str, Any]:
+    """Простой health-check эндпоинт."""
 
-        bot_service: BotService = self.server.bot_service  # type: ignore[attr-defined]
-        bot_service.log_usage_stat(sender_id, phone_number, "contact")
+    return {"status": "ok", "message": MSG_START, "button": BTN_SHARE_PHONE}
 
-        guest_info = bot_service.get_guest_bonus(phone_number)
-        if not guest_info:
-            self._send_json(200, {"reply": MSG_NO_BONUS})
-            return
 
-        first_name = guest_info.get("first_name") or from_user.get("first_name") or "Гость"
-        bonus_amount = bot_service.format_bonus_amount(guest_info.get("bonus_balances"))
-        level = guest_info.get("loyalty_level") or "-"
-        response_text = MSG_BALANCE_TEMPLATE.format(
-            first_name=first_name,
-            amount=bonus_amount,
-            level=level,
-        )
-        expire_date = guest_info.get("expire_date")
-        if expire_date and bonus_amount > 0:
-            response_text += MSG_EXPIRY_TEMPLATE.format(date=expire_date)
+@app.post("/webhook")
+async def webhook(request: Request):  # type: ignore[override]
+    """Обработчик Telegram webhook."""
 
-        self._send_json(200, {"reply": response_text})
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return _bad_request("invalid json")
 
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A003 (совместимость)
-        logger.info("%s - %s", self.address_string(), format % args)
+    if not isinstance(payload, dict):
+        return _bad_request("invalid json")
 
-    def _content_length(self) -> int:
-        header = self.headers.get("Content-Length")
-        if not header:
-            return 0
-        try:
-            return int(header)
-        except ValueError:
-            return 0
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return _bad_request("message field is required")
 
-    def _send_json(self, status_code: int, payload: Dict[str, Any]) -> None:
-        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status_code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.end_headers()
-        self.wfile.write(encoded)
+    logger.info(
+        "Получено сообщение: %s",
+        json.dumps(sanitize_payload(message), ensure_ascii=False),
+    )
+
+    contact = message.get("contact")
+    if not isinstance(contact, dict):
+        return _bad_request("contact field is required")
+    phone_number = contact.get("phone_number")
+    if not phone_number:
+        return _bad_request("phone_number is required")
+
+    from_user = message.get("from") if isinstance(message.get("from"), dict) else {}
+    sender_id = from_user.get("id") if isinstance(from_user, dict) else None
+    contact_user_id = contact.get("user_id")
+    if (
+        sender_id is not None
+        and contact_user_id is not None
+        and sender_id != contact_user_id
+    ):
+        return {"reply": MSG_INVALID_CONTACT}
+
+    bot_service = _get_bot_service(request)
+    bot_service.log_usage_stat(sender_id, phone_number, "contact")
+
+    guest_info = bot_service.get_guest_bonus(phone_number)
+    if not guest_info:
+        return {"reply": MSG_NO_BONUS}
+
+    first_name = guest_info.get("first_name") or from_user.get("first_name") or "Гость"
+    bonus_amount = bot_service.format_bonus_amount(guest_info.get("bonus_balances"))
+    level = guest_info.get("loyalty_level") or "-"
+    response_text = MSG_BALANCE_TEMPLATE.format(
+        first_name=first_name,
+        amount=bonus_amount,
+        level=level,
+    )
+    expire_date = guest_info.get("expire_date")
+    if expire_date and bonus_amount > 0:
+        response_text += MSG_EXPIRY_TEMPLATE.format(date=expire_date)
+
+    return {"reply": response_text}
 
 
 def run_server() -> None:
+    """Запустить uvicorn-сервер локально."""
+
     settings = get_settings()
-    data = load_bonus_data(settings.bonus_data_file)
-    bot_service = BotService(data, settings.default_expiry_days)
-    server = TelegramHTTPServer(("0.0.0.0", settings.port), bot_service)
-    logger.info("Сервер запущен на порту %s", settings.port)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        logger.info("Остановка сервера по Ctrl+C")
-    finally:
-        server.server_close()
+    uvicorn.run("main:app", host="0.0.0.0", port=settings.port, log_level="info")
 
 
 if __name__ == "__main__":
