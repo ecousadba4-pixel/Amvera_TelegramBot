@@ -17,6 +17,41 @@ from config import get_settings
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+SENSITIVE_KEYS = {"phone_number", "phone"}
+
+
+def mask_phone(phone: Any, visible_digits: int = 4) -> str:
+    """Возвращает маску номера телефона, сохраняя последние цифры."""
+
+    if phone is None:
+        return "***"
+    if not isinstance(phone, str):
+        phone = str(phone)
+    digits = "".join(ch for ch in phone if ch.isdigit())
+    if not digits:
+        return "***"
+    visible_digits = max(0, visible_digits)
+    suffix = digits[-visible_digits:] if visible_digits else ""
+    masked_length = max(len(digits) - visible_digits, 0)
+    masked = "*" * masked_length + suffix
+    return masked
+
+
+def sanitize_payload(payload: Any) -> Any:
+    """Рекурсивно маскирует чувствительные данные в словарях/списках."""
+
+    if isinstance(payload, dict):
+        sanitized: dict[str, Any] = {}
+        for key, value in payload.items():
+            if key in SENSITIVE_KEYS and isinstance(value, str):
+                sanitized[key] = mask_phone(value)
+            else:
+                sanitized[key] = sanitize_payload(value)
+        return sanitized
+    if isinstance(payload, list):
+        return [sanitize_payload(item) for item in payload]
+    return payload
+
 # --- Константы ---
 
 # Названия таблиц и столбцов (если нужно централизовать)
@@ -222,7 +257,11 @@ async def handle_contact(message: types.Message):
 
     phone_number = message.contact.phone_number
     user_id = message.from_user.id
-    logger.info("Received contact from %s (user_id=%s)", phone_number, user_id)
+    logger.info(
+        "Received contact from %s (user_id=%s)",
+        mask_phone(phone_number),
+        user_id,
+    )
     bot_service = app.state.bot_service
     
     # Записать событие
@@ -234,7 +273,12 @@ async def handle_contact(message: types.Message):
     try:
         guest_info = await bot_service.get_guest_bonus(phone_number)
     except Exception as e:
-        logger.error(f"Failed to fetch bonus info for phone {phone_number} (user_id={user_id}): {e}")
+        logger.error(
+            "Failed to fetch bonus info for phone %s (user_id=%s): %s",
+            mask_phone(phone_number),
+            user_id,
+            e,
+        )
         await message.answer("Произошла ошибка при получении данных. Попробуйте позже.")
         return
 
@@ -260,7 +304,11 @@ async def handle_contact(message: types.Message):
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     data = await request.json()
-    logger.info("Webhook received: %s", data.get("message") or data.get("update_id"))
+    message_data = data.get("message")
+    if isinstance(message_data, dict):
+        logger.info("Webhook received: %s", sanitize_payload(message_data))
+    else:
+        logger.info("Webhook received: %s", data.get("update_id"))
     try:
         update = Update(**data)
     except Exception:
