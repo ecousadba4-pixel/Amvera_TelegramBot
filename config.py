@@ -1,35 +1,38 @@
-"""Application configuration management."""
+"""Простая конфигурация приложения без внешних зависимостей."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
 from functools import lru_cache
+import os
 from typing import Optional
 
-from pydantic import Field, HttpUrl, PostgresDsn, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
 
+@dataclass(frozen=True)
+class Settings:
+    """Настройки приложения, полученные из переменных окружения."""
 
-class Settings(BaseSettings):
-    """Configuration loaded from environment variables."""
-
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
-
-    telegram_bot_token: str = Field(alias="TELEGRAM_BOT_TOKEN")
-    database_url: PostgresDsn = Field(alias="DATABASE_URL")
-    webhook_url: Optional[HttpUrl] = Field(default=None, alias="WEBHOOK_URL")
-    port: int = Field(default=8000, alias="PORT", ge=1, le=65535)
-    pool_min_size: int = Field(default=1, alias="POOL_MIN_SIZE", ge=1)
-    pool_max_size: int = Field(default=10, alias="POOL_MAX_SIZE", ge=1)
-
-    @model_validator(mode="after")
-    def validate_pool_limits(self) -> "Settings":
-        if self.pool_min_size > self.pool_max_size:
-            msg = "POOL_MIN_SIZE cannot be greater than POOL_MAX_SIZE"
-            raise ValueError(msg)
-        return self
+    port: int
+    bonus_data_file: Optional[str]
+    default_expiry_days: int
 
 
 @lru_cache
 def get_settings() -> Settings:
-    """Return a cached instance of application settings."""
+    """Вернуть кэшированный экземпляр настроек."""
 
-    return Settings()
+    port_str = os.getenv("PORT", "8000")
+    try:
+        port = int(port_str)
+    except ValueError:
+        port = 8000
 
+    file_path = os.getenv("BONUS_DATA_FILE")
+
+    expiry_days_str = os.getenv("DEFAULT_EXPIRY_DAYS", "365")
+    try:
+        expiry_days = int(expiry_days_str)
+    except ValueError:
+        expiry_days = 365
+
+    return Settings(port=port, bonus_data_file=file_path, default_expiry_days=expiry_days)

@@ -1,23 +1,47 @@
-import asyncio
-import logging
-from contextlib import asynccontextmanager
-from datetime import datetime
-from decimal import Decimal, InvalidOperation
-from typing import Any, Optional
+"""Упрощённая версия Telegram webhook сервера без внешних зависимостей."""
 
-import asyncpg
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import CommandStart
-from aiogram.types import KeyboardButton, ReplyKeyboardMarkup, Update
-from dateutil.relativedelta import relativedelta
-from fastapi import FastAPI, Request, Response, status
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Dict, Optional
 
 from config import get_settings
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 SENSITIVE_KEYS = {"phone_number", "phone"}
+
+MSG_START = (
+    "Нажмите кнопку Поделиться номером телефона внизу, чтобы узнать бонусный баланс."
+)
+BTN_SHARE_PHONE = "Поделиться номером телефона"
+MSG_INVALID_CONTACT = (
+    "❌ Вы можете проверить информацию только для своего номера телефона."
+)
+MSG_NO_BONUS = "Бонусы для указанного номера не найдены."
+MSG_BALANCE_TEMPLATE = (
+    "👋 {first_name}, у Вас накоплено бонусов {amount} рублей.\nВаш уровень лояльности — {level}."
+)
+MSG_EXPIRY_TEMPLATE = "\nСрок действия бонусов: до {date}."
+
+DEFAULT_BONUS_DATA: Dict[str, Dict[str, Any]] = {
+    "79990000000": {
+        "first_name": "Ирина",
+        "loyalty_level": "gold",
+        "bonus_balances": 1250,
+        "last_visit": "2024-08-15",
+    },
+    "79995556677": {
+        "first_name": "Алексей",
+        "loyalty_level": "silver",
+        "bonus_balances": 320,
+        "last_visit": "2024-07-01",
+    },
+}
 
 
 def mask_phone(phone: Any, visible_digits: int = 4) -> str:
@@ -52,274 +76,221 @@ def sanitize_payload(payload: Any) -> Any:
         return [sanitize_payload(item) for item in payload]
     return payload
 
-# --- Константы ---
 
-# Названия таблиц и столбцов (если нужно централизовать)
-TABLE_BONUSES_BALANCE = "bonuses_balance"
-COL_PHONE = "phone"
-COL_FIRST_NAME = "first_name"
-COL_LOYALTY_LEVEL = "loyalty_level"
-COL_BONUS_BALANCES = "bonus_balances"
-COL_LAST_DATE_VISIT = "last_date_visit"
+def normalize_phone(phone: Any) -> str:
+    """Привести телефон к формату из 11 цифр (Россия)."""
 
-TABLE_TELEGRAM_BOT_STATS = "telegram_bot_usage_stats"
-COL_USER_ID = "user_id"
-COL_PHONE_STATS = "phone"
-COL_COMMAND = "command"
+    if phone is None:
+        return ""
+    digits = "".join(ch for ch in str(phone) if ch.isdigit())
+    if len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    if len(digits) == 10:
+        digits = "7" + digits
+    return digits if len(digits) == 11 else ""
 
-# Тексты сообщений и кнопок
-MSG_START = "Нажмите кнопку Поделиться номером телефона внизу, чтобы узнать бонусный баланс."
-BTN_SHARE_PHONE = "Поделиться номером телефона"
-MSG_INVALID_CONTACT = "❌ Вы можете проверить информацию только для своего номера телефона."
-MSG_NO_BONUS = "Бонусы для указанного номера не найдены."
-MSG_BALANCE_TEMPLATE = "👋 {first_name}, у Вас накоплено бонусов {amount} рублей.\nВаш уровень лояльности — {level}."
-MSG_EXPIRY_TEMPLATE = "\nСрок действия бонусов: до {date}."
 
-# SQL Запросы
-SQL_FETCH_USER = f"""
-SELECT {COL_FIRST_NAME}, {COL_LOYALTY_LEVEL}, {COL_BONUS_BALANCES}, {COL_LAST_DATE_VISIT}
-FROM {TABLE_BONUSES_BALANCE}
-WHERE {COL_PHONE} = $1
-"""
+def load_bonus_data(path: Optional[str]) -> Dict[str, Dict[str, Any]]:
+    """Загрузить бонусные данные из JSON-файла или вернуть значения по умолчанию."""
 
-SQL_LOG_USAGE = f"""
-INSERT INTO {TABLE_TELEGRAM_BOT_STATS} ({COL_USER_ID}, {COL_PHONE_STATS}, {COL_COMMAND})
-VALUES ($1, $2, $3)
-"""
+    if not path:
+        return {key: dict(value) for key, value in DEFAULT_BONUS_DATA.items()}
 
-# --- /Константы ---
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            payload = json.load(file)
+    except FileNotFoundError:
+        logger.warning("Файл %s не найден. Используются тестовые данные.", path)
+        return {key: dict(value) for key, value in DEFAULT_BONUS_DATA.items()}
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "Не удалось прочитать файл %s (%s). Используются тестовые данные.", path, exc
+        )
+        return {key: dict(value) for key, value in DEFAULT_BONUS_DATA.items()}
 
-settings = get_settings()
+    if not isinstance(payload, dict):
+        logger.warning("Структура файла %s некорректна. Используются тестовые данные.", path)
+        return {key: dict(value) for key, value in DEFAULT_BONUS_DATA.items()}
 
-bot = Bot(token=settings.telegram_bot_token)
-dp = Dispatcher()
+    normalized: Dict[str, Dict[str, Any]] = {}
+    for phone, data in payload.items():
+        if not isinstance(data, dict):
+            continue
+        normalized_phone = normalize_phone(phone)
+        if normalized_phone:
+            normalized[normalized_phone] = dict(data)
+    if not normalized:
+        logger.warning("В файле %s нет корректных записей. Используются тестовые данные.", path)
+        return {key: dict(value) for key, value in DEFAULT_BONUS_DATA.items()}
+    return normalized
+
 
 class BotService:
-    def __init__(self, dsn: str, min_size: int, max_size: int):
-        self._dsn = dsn
-        self._min_size = min_size
-        self._max_size = max_size
-        self._pool: Optional[asyncpg.Pool] = None
-        self._pool_lock = asyncio.Lock()
+    """Минималистичная логика работы с бонусами."""
 
-    def _pool_active(self) -> bool:
-        return bool(
-            self._pool
-            and not getattr(self._pool, "_closing", False)
-            and not getattr(self._pool, "_closed", False)
-        )
+    def __init__(self, bonus_data: Dict[str, Dict[str, Any]], default_expiry_days: int) -> None:
+        self._bonus_data = bonus_data
+        self._default_expiry_days = max(default_expiry_days, 1)
+        self._stats: list[Dict[str, Any]] = []
 
-    async def _ensure_pool(self) -> asyncpg.Pool:
-        if self._pool_active():
-            return self._pool
-
-        async with self._pool_lock:
-            if self._pool_active():
-                return self._pool
-            logger.info("Creating DB pool")
-            try:
-                self._pool = await asyncpg.create_pool(
-                    self._dsn,
-                    min_size=self._min_size,
-                    max_size=self._max_size,
-                )
-                logger.info("DB pool created")
-            except Exception as exc:
-                logger.exception("Failed to create DB pool")
-                self._pool = None
-                raise RuntimeError("Database pool is unavailable") from exc
-            return self._pool
-
-    async def close(self) -> None:
-        async with self._pool_lock:
-            if not self._pool_active():
-                return
-            try:
-                await self._pool.close()
-                logger.info("DB pool closed")
-            except Exception:
-                logger.exception("Failed to close DB pool")
-            finally:
-                self._pool = None
-
-    @staticmethod
-    def normalize_phone(phone: str) -> str:
-        digits = ''.join(ch for ch in (phone or "") if ch.isdigit())
-        return digits[-10:] if len(digits) >= 10 else digits
-
-    async def fetch_user_row(self, phone_number: str) -> Optional[asyncpg.Record]:
-        """Получение строки пользователя по телефону."""
-        clean_phone = self.normalize_phone(phone_number)
-        if not clean_phone:
-            return None
-        query = SQL_FETCH_USER
-        try:
-            pool = await self._ensure_pool()
-            async with pool.acquire() as conn:
-                return await conn.fetchrow(query, clean_phone)
-        except RuntimeError:
-            raise
-        except Exception:
-            logger.exception("Database query failed")
-            return None
-
-    def parse_guest_info(self, row: Optional[asyncpg.Record]) -> Optional[dict[str, Any]]:
-        """Конвертация строки БД в user dict для выдачи в боте."""
-        if not row:
-            return None
-        row_dict = dict(row)
-        last_visit: Optional[datetime] = row_dict.get(COL_LAST_DATE_VISIT)
-        if not last_visit:
-            expire_date = "Неизвестно"
-        else:
-            try:
-                expire_date = (last_visit + relativedelta(months=12)).strftime("%d.%m.%Y")
-            except Exception as e:
-                logger.warning(f"Failed to calculate expire date for {last_visit}: {e}")
-                expire_date = "Неизвестно"
-        return {
-            "first_name": row_dict.get(COL_FIRST_NAME) or "Гость",
-            "loyalty_level": row_dict.get(COL_LOYALTY_LEVEL) or "—",
-            "bonus_balances": row_dict.get(COL_BONUS_BALANCES) or 0,
-            "expire_date": expire_date,
+    def log_usage_stat(self, user_id: Optional[int], phone: str, command: str) -> None:
+        entry = {
+            "user_id": user_id,
+            "phone": mask_phone(phone),
+            "command": command,
+            "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
         }
+        self._stats.append(entry)
+        logger.info("Событие: %s", entry)
 
-    async def get_guest_bonus(self, phone_number: str) -> Optional[dict[str, Any]]:
-        """Единая точка входа во всю бизнес-логику выдачи бонусов."""
-        if not phone_number:
+    def get_guest_bonus(self, phone: str) -> Optional[Dict[str, Any]]:
+        normalized = normalize_phone(phone)
+        if not normalized:
             return None
-        row = await self.fetch_user_row(phone_number)
-        return self.parse_guest_info(row)
+        guest = self._bonus_data.get(normalized)
+        if not guest:
+            return None
+        prepared = dict(guest)
+        if not prepared.get("expire_date"):
+            expire_date = self._calculate_expiry(prepared.get("last_visit"))
+            if expire_date:
+                prepared["expire_date"] = expire_date
+        return prepared
 
-    async def log_usage_stat(self, user_id: int, phone: str, command: str) -> None:
-        """Запись события использования бота."""
-        query = SQL_LOG_USAGE
+    def _calculate_expiry(self, last_visit: Optional[str]) -> Optional[str]:
+        if not last_visit:
+            return None
         try:
-            pool = await self._ensure_pool()
-            async with pool.acquire() as conn:
-                await conn.execute(query, user_id, phone, command)
-        except Exception:
-            logger.exception("Failed to log usage stat")
+            visit_dt = datetime.fromisoformat(last_visit)
+        except ValueError:
+            return None
+        expire_date = visit_dt + timedelta(days=self._default_expiry_days)
+        return expire_date.date().isoformat()
 
     @staticmethod
     def format_bonus_amount(value: Any) -> int:
-        """Безопасное преобразование бонусного баланса к int."""
-
         try:
-            return int(Decimal(str(value)))
-        except (InvalidOperation, TypeError, ValueError):
-            logger.warning("Could not convert bonus_balances '%s' to int", value)
+            return int(float(value))
+        except (TypeError, ValueError):
+            logger.warning("Не удалось преобразовать значение бонусов: %s", value)
             return 0
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    bot_service = BotService(
-        dsn=str(settings.database_url),
-        min_size=settings.pool_min_size,
-        max_size=settings.pool_max_size,
-    )
-    app.state.bot_service = bot_service
-    app.state.settings = settings
-    if settings.webhook_url:
+
+class TelegramHTTPServer(ThreadingHTTPServer):
+    def __init__(self, server_address: tuple[str, int], bot_service: BotService) -> None:
+        super().__init__(server_address, TelegramRequestHandler)
+        self.bot_service = bot_service
+        self.allow_reuse_address = True
+
+
+class TelegramRequestHandler(BaseHTTPRequestHandler):
+    server_version = "TelegramStub/1.0"
+
+    def do_GET(self) -> None:  # noqa: N802 (совместимость с BaseHTTPRequestHandler)
+        if self.path != "/":
+            self._send_json(404, {"error": "not found"})
+            return
+        self._send_json(200, {"status": "ok", "message": MSG_START, "button": BTN_SHARE_PHONE})
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path != "/webhook":
+            self._send_json(404, {"error": "not found"})
+            return
+
+        content_length = self._content_length()
+        raw_body = self.rfile.read(content_length) if content_length else b""
         try:
-            logger.info("Setting Telegram webhook to %s", settings.webhook_url)
-            await bot.set_webhook(str(settings.webhook_url))
-            logger.info("Webhook set")
-        except Exception:
-            logger.exception("Failed to set webhook (continuing without webhook)")
-    yield
-    logger.info("Shutting down: deleting webhook and closing pool")
-    try:
-        await bot.delete_webhook()
-    except Exception:
-        logger.exception("Failed to delete webhook (ignoring)")
-    await bot_service.close()
+            payload = json.loads(raw_body.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            self._send_json(400, {"error": "invalid json"})
+            return
 
-app = FastAPI(lifespan=lifespan)
+        message = payload.get("message")
+        if not isinstance(message, dict):
+            self._send_json(400, {"error": "message field is required"})
+            return
 
-@dp.message(CommandStart())
-async def cmd_start(message: types.Message):
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=BTN_SHARE_PHONE, request_contact=True)]
-        ],
-        resize_keyboard=True
-    )
-    await message.answer(MSG_START, reply_markup=keyboard)
-
-@dp.message(F.contact)
-async def handle_contact(message: types.Message):
-    # --- ПРОВЕРКА: принадлежит ли контакт отправителю ---
-    if message.contact.user_id != message.from_user.id:
-        await message.answer(MSG_INVALID_CONTACT)
-        return
-    # --- КОНЕЦ ПРОВЕРКИ ---
-
-    phone_number = message.contact.phone_number
-    user_id = message.from_user.id
-    logger.info(
-        "Received contact from %s (user_id=%s)",
-        mask_phone(phone_number),
-        user_id,
-    )
-    bot_service = app.state.bot_service
-    
-    # Записать событие
-    try:
-        await bot_service.log_usage_stat(user_id=user_id, phone=phone_number, command="contact")
-    except Exception as e: # Логируем ошибку логирования, но не прерываем основной процесс
-        logger.error(f"Failed to log usage stat for user {user_id}: {e}")
-
-    try:
-        guest_info = await bot_service.get_guest_bonus(phone_number)
-    except Exception as e:
-        logger.error(
-            "Failed to fetch bonus info for phone %s (user_id=%s): %s",
-            mask_phone(phone_number),
-            user_id,
-            e,
+        logger.info(
+            "Получено сообщение: %s",
+            json.dumps(sanitize_payload(message), ensure_ascii=False),
         )
-        await message.answer("Произошла ошибка при получении данных. Попробуйте позже.")
-        return
 
-    if not guest_info:
-        await message.answer(MSG_NO_BONUS)
-        return
+        contact = message.get("contact")
+        if not isinstance(contact, dict):
+            self._send_json(400, {"error": "contact field is required"})
+            return
+        phone_number = contact.get("phone_number")
+        if not phone_number:
+            self._send_json(400, {"error": "phone_number is required"})
+            return
 
-    bonus_amount = bot_service.format_bonus_amount(guest_info['bonus_balances'])
+        from_user = message.get("from") if isinstance(message.get("from"), dict) else {}
+        sender_id = from_user.get("id") if isinstance(from_user, dict) else None
+        contact_user_id = contact.get("user_id")
+        if (
+            sender_id is not None
+            and contact_user_id is not None
+            and sender_id != contact_user_id
+        ):
+            self._send_json(200, {"reply": MSG_INVALID_CONTACT})
+            return
 
-    response_text = MSG_BALANCE_TEMPLATE.format(
-        first_name=guest_info['first_name'],
-        amount=bonus_amount,
-        level=guest_info['loyalty_level']
-    )
-    if bonus_amount > 0:
-        response_text += MSG_EXPIRY_TEMPLATE.format(date=guest_info['expire_date'])
+        bot_service: BotService = self.server.bot_service  # type: ignore[attr-defined]
+        bot_service.log_usage_stat(sender_id, phone_number, "contact")
 
+        guest_info = bot_service.get_guest_bonus(phone_number)
+        if not guest_info:
+            self._send_json(200, {"reply": MSG_NO_BONUS})
+            return
+
+        first_name = guest_info.get("first_name") or from_user.get("first_name") or "Гость"
+        bonus_amount = bot_service.format_bonus_amount(guest_info.get("bonus_balances"))
+        level = guest_info.get("loyalty_level") or "-"
+        response_text = MSG_BALANCE_TEMPLATE.format(
+            first_name=first_name,
+            amount=bonus_amount,
+            level=level,
+        )
+        expire_date = guest_info.get("expire_date")
+        if expire_date and bonus_amount > 0:
+            response_text += MSG_EXPIRY_TEMPLATE.format(date=expire_date)
+
+        self._send_json(200, {"reply": response_text})
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A003 (совместимость)
+        logger.info("%s - %s", self.address_string(), format % args)
+
+    def _content_length(self) -> int:
+        header = self.headers.get("Content-Length")
+        if not header:
+            return 0
+        try:
+            return int(header)
+        except ValueError:
+            return 0
+
+    def _send_json(self, status_code: int, payload: Dict[str, Any]) -> None:
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+
+def run_server() -> None:
+    settings = get_settings()
+    data = load_bonus_data(settings.bonus_data_file)
+    bot_service = BotService(data, settings.default_expiry_days)
+    server = TelegramHTTPServer(("0.0.0.0", settings.port), bot_service)
+    logger.info("Сервер запущен на порту %s", settings.port)
     try:
-        await message.answer(response_text)
-    except Exception as e:
-        logger.error(f"Failed to send response to user {user_id}: {e}")
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("Остановка сервера по Ctrl+C")
+    finally:
+        server.server_close()
 
-@app.post("/webhook")
-async def telegram_webhook(request: Request):
-    data = await request.json()
-    message_data = data.get("message")
-    if isinstance(message_data, dict):
-        logger.info("Webhook received: %s", sanitize_payload(message_data))
-    else:
-        logger.info("Webhook received: %s", data.get("update_id"))
-    try:
-        update = Update(**data)
-    except Exception:
-        logger.exception("Failed to parse update")
-        return Response(status_code=status.HTTP_400_BAD_REQUEST)
-    try:
-        await dp.feed_update(bot, update)
-    except Exception:
-        logger.exception("Failed to feed update")
-    return Response(status_code=status.HTTP_200_OK)
 
-@app.get("/")
-async def root():
-    return {"status": "ok"}
+if __name__ == "__main__":
+    run_server()
