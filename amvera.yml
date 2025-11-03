@@ -1,8 +1,9 @@
 app:
   name: telegram-loyal
-  run: uvicorn main:app --host 0.0.0.0 --port $PORT
+  run: python main.py
   env:
-    TELEGRAM_BOT_TOKEN: $TELEGRAM_BOT_TOKEN
-    DATABASE_URL: $DATABASE_URL
+    PORT: $PORT
+    BONUS_DATA_FILE: $BONUS_DATA_FILE
+    DEFAULT_EXPIRY_DAYS: $DEFAULT_EXPIRY_DAYS
   ports:
     - $PORT
