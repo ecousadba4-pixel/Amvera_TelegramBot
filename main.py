@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -12,10 +13,36 @@ from aiogram.types import KeyboardButton, ReplyKeyboardMarkup, Update
 from dateutil.relativedelta import relativedelta
 from fastapi import FastAPI, Request, Response, status
 
+from loguru import logger
+
 from config import get_settings
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+
+class InterceptHandler(logging.Handler):
+    """Redirect standard logging records to Loguru."""
+
+    def emit(self, record: logging.LogRecord) -> None:  # type: ignore[override]
+        try:
+            level = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+        frame, depth = logging.currentframe(), 2
+        while frame and frame.f_code.co_filename == logging.__file__:
+            frame = frame.f_back
+            depth += 1
+        logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
+
+
+logging.basicConfig(handlers=[InterceptHandler()], level=0)
+logger.remove()
+logger.add(
+    sys.stdout,
+    level="INFO",
+    format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | {name}:{function}:{line} - {message}",
+    enqueue=True,
+    backtrace=True,
+    diagnose=False,
+)
 
 # --- Константы ---
 
