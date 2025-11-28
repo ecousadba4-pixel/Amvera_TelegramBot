@@ -14,6 +14,7 @@ from dateutil.relativedelta import relativedelta
 from fastapi import FastAPI, Request, Response, status
 from loguru import logger
 from prometheus_fastapi_instrumentator import Instrumentator  # ✨ добавили
+from json import JSONDecodeError
 
 from config import get_settings
 
@@ -296,7 +297,12 @@ async def handle_contact(message: types.Message):
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
-    data = await request.json()
+    try:
+        data = await request.json()
+    except JSONDecodeError:
+        logger.warning("Non-JSON body received on /webhook")
+        return Response(status_code=status.HTTP_400_BAD_REQUEST)
+
     logger.info("Webhook received: %s", data.get("message") or data.get("update_id"))
     try:
         update = Update(**data)
