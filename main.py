@@ -216,9 +216,6 @@ async def lifespan(app: FastAPI):
     app.state.bot_service = bot_service
     app.state.settings = settings
 
-    # ✨ Подключаем Prometheus /metrics
-    Instrumentator().instrument(app).expose(app, endpoint="/metrics")
-
     if settings.webhook_url:
         try:
             logger.info("Setting Telegram webhook to %s", settings.webhook_url)
