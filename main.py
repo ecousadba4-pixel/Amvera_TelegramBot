@@ -12,8 +12,8 @@ from aiogram.filters import CommandStart
 from aiogram.types import KeyboardButton, ReplyKeyboardMarkup, Update
 from dateutil.relativedelta import relativedelta
 from fastapi import FastAPI, Request, Response, status
-
 from loguru import logger
+from prometheus_fastapi_instrumentator import Instrumentator  # ✨ добавили
 
 from config import get_settings
 
@@ -46,7 +46,7 @@ logger.add(
 
 # --- Константы ---
 
-# Названия таблиц и столбцов (если нужно централизовать)
+# Названия таблиц и столбцов
 TABLE_BONUSES_BALANCE = "bonuses_balance"
 COL_PHONE = "phone"
 COL_FIRST_NAME = "first_name"
@@ -67,7 +67,7 @@ MSG_NO_BONUS = "Бонусы для указанного номера не на�
 MSG_BALANCE_TEMPLATE = "👋 {first_name}, у Вас накоплено бонусов {amount} рублей.\nВаш уровень лояльности — {level}."
 MSG_EXPIRY_TEMPLATE = "\nСрок действия бонусов: до {date}."
 
-# SQL Запросы
+# SQL запросы
 SQL_FETCH_USER = f"""
 SELECT {COL_FIRST_NAME}, {COL_LOYALTY_LEVEL}, {COL_BONUS_BALANCES}, {COL_LAST_DATE_VISIT}
 FROM {TABLE_BONUSES_BALANCE}
@@ -81,10 +81,12 @@ VALUES ($1, $2, $3)
 
 # --- /Константы ---
 
+
 settings = get_settings()
 
 bot = Bot(token=settings.telegram_bot_token)
 dp = Dispatcher()
+
 
 class BotService:
     def __init__(self, dsn: str, min_size: int, max_size: int):
@@ -196,12 +198,12 @@ class BotService:
     @staticmethod
     def format_bonus_amount(value: Any) -> int:
         """Безопасное преобразование бонусного баланса к int."""
-
         try:
             return int(Decimal(str(value)))
         except (InvalidOperation, TypeError, ValueError):
             logger.warning("Could not convert bonus_balances '%s' to int", value)
             return 0
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -212,6 +214,10 @@ async def lifespan(app: FastAPI):
     )
     app.state.bot_service = bot_service
     app.state.settings = settings
+
+    # ✨ Подключаем Prometheus /metrics
+    Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+
     if settings.webhook_url:
         try:
             logger.info("Setting Telegram webhook to %s", settings.webhook_url)
@@ -227,7 +233,9 @@ async def lifespan(app: FastAPI):
         logger.exception("Failed to delete webhook (ignoring)")
     await bot_service.close()
 
+
 app = FastAPI(lifespan=lifespan)
+
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -238,6 +246,7 @@ async def cmd_start(message: types.Message):
         resize_keyboard=True
     )
     await message.answer(MSG_START, reply_markup=keyboard)
+
 
 @dp.message(F.contact)
 async def handle_contact(message: types.Message):
@@ -251,11 +260,11 @@ async def handle_contact(message: types.Message):
     user_id = message.from_user.id
     logger.info("Received contact from %s (user_id=%s)", phone_number, user_id)
     bot_service = app.state.bot_service
-    
+
     # Записать событие
     try:
         await bot_service.log_usage_stat(user_id=user_id, phone=phone_number, command="contact")
-    except Exception as e: # Логируем ошибку логирования, но не прерываем основной процесс
+    except Exception as e:  # Логируем ошибку логирования, но не прерываем основной процесс
         logger.error(f"Failed to log usage stat for user {user_id}: {e}")
 
     try:
@@ -284,6 +293,7 @@ async def handle_contact(message: types.Message):
     except Exception as e:
         logger.error(f"Failed to send response to user {user_id}: {e}")
 
+
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     data = await request.json()
@@ -299,6 +309,8 @@ async def telegram_webhook(request: Request):
         logger.exception("Failed to feed update")
     return Response(status_code=status.HTTP_200_OK)
 
+
 @app.get("/")
 async def root():
     return {"status": "ok"}
+
