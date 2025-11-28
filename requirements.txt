@@ -7,3 +7,4 @@ aiohttp
 pydantic-settings
 pydantic
 loguru
+prometheus-fastapi-instrumentator
