@@ -1,8 +1,0 @@
-app:
-  name: telegram-loyal
-  run: uvicorn main:app --host 0.0.0.0 --port $PORT
-  env:
-    TELEGRAM_BOT_TOKEN: $TELEGRAM_BOT_TOKEN
-    DATABASE_URL: $DATABASE_URL
-  ports:
-    - $PORT
