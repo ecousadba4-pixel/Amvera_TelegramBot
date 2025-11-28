@@ -233,7 +233,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
